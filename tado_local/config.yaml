@@ -2,7 +2,7 @@ name: "Tado Local"
 version: "0.0.1-alpha.10"
 slug: "tado_local"
 description: "Manage TADO devices locally via HomeKit bridge"
-url: "https://github.com/rajeevan/TadoLocal"
+url: "https://github.com/VVlasy/hassio-tado-local"
 arch:
   - amd64
   - aarch64
@@ -32,5 +32,4 @@ schema:
   state_db: str
   bridge_ip: str
   pin: str
-# image: rajeevan/tado_local_{arch}
-image: ghcr.io/rajeevan/tado_local_{arch}
+image: ghcr.io/vvlasy/tado_local_{arch}

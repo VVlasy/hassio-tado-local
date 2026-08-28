@@ -3,29 +3,59 @@
 [![GitHub Release][releases-shield]][releases]
 [![License][license-shield]](LICENSE)
 
-Home Assistant add-on repository for [TadoLocal](https://github.com/rajeevan/TadoLocal) - a local REST API for managing TADO devices via the HomeKit bridge.
+Home Assistant add-on repository for TadoLocal - a local REST API for managing
+TADO devices via the HomeKit bridge.
+
+> This is a maintained fork of an upstream add-on repository that no longer
+> publishes working images. The add-on itself is unchanged; this fork exists to
+> build and publish the container images for the architectures listed below.
 
 ## About
 
 This repository provides a Home Assistant add-on that runs the TadoLocal project, enabling local control of TADO devices without cloud dependencies. The add-on communicates directly with your TADO bridge using the HomeKit protocol.
+
+Note that this repository contains packaging only. The TadoLocal application
+source is downloaded at Docker build time — see `tado_local/Dockerfile` for the
+exact upstream source it pulls.
 
 ## Features
 
 - 🏠 **Local Control**: No cloud dependency - all communication happens on your local network
 - 🔌 **REST API**: Full REST API for integration with Home Assistant and other platforms
 - 📊 **Real-time Updates**: Server-Sent Events (SSE) for real-time device state
-- 🌐 **Web Interface**: Accessible via Home Assistant Ingress
+- 🌐 **Web Interface**: Served on port 4407
 - 💾 **Persistent Storage**: State stored in Home Assistant's config directory
-- 🐳 **Multi-Architecture**: Supports both amd64 and arm64 platforms
+- 🐳 **Multi-Architecture**: `amd64` and `aarch64`
+
+## Supported architectures
+
+| Architecture | Supported | Image |
+|---|---|---|
+| `amd64` | ✅ | `ghcr.io/vvlasy/tado_local_amd64` |
+| `aarch64` | ✅ | `ghcr.io/vvlasy/tado_local_aarch64` |
+| `armv7` / `armhf` / `i386` | ❌ | not built |
+
+32-bit architectures are deliberately not built: there are no native runners for
+them and 32-bit musl has no prebuilt `cryptography` wheels, so those builds
+compile Rust under emulation and time out.
 
 ## Installation
 
 1. In Home Assistant, go to **Settings** > **Add-ons** > **Add-on Store**
 2. Click the three dots (⋮) in the top right corner
 3. Select **Repositories**
-4. Add this repository URL: `https://github.com/rajeevan/hassio-tado-local`
+4. Add this repository URL: `https://github.com/VVlasy/hassio-tado-local`
 5. Click **Add**
 6. Find "Tado Local" in the Add-on Store and install it
+
+If you previously added the upstream repository, remove it first and uninstall
+the old add-on — otherwise Home Assistant may keep resolving the add-on to the
+upstream images, which are not published.
+
+Images are pulled from the GitHub Container Registry under
+`ghcr.io/vvlasy/`. They must be **public** for Home Assistant to install the
+add-on; the Supervisor pulls anonymously, and a private package produces the
+same `[404] manifest unknown` error as a missing one.
 
 ## Configuration
 
@@ -38,9 +68,9 @@ The add-on requires two configuration options:
 
 ### Web Interface
 
-Access the web interface via Home Assistant Ingress:
+Access the web interface from the add-on panel:
 - Click **Open Web UI** in the add-on panel
-- Or use the **Ingress** link
+- Or browse directly to `http://<home-assistant-host>:4407/`
 
 The web interface provides:
 - Device status and control
@@ -49,7 +79,7 @@ The web interface provides:
 
 ### REST API
 
-The add-on exposes a REST API accessible via Ingress. Key endpoints:
+The add-on exposes a REST API on port 4407. Key endpoints:
 
 - `GET /api/v1/zones` - List all zones
 - `GET /api/v1/zones/{zone_id}` - Get zone details
@@ -72,7 +102,7 @@ See the interactive API documentation at `/docs` for complete endpoint details.
 │  (REST API)     │
 └────────┬────────┘
          │
-         ├──→ Home Assistant Ingress (port 4407)
+         ├──→ Home Assistant (port 4407)
          └──→ SQLite Database (/config/tado_local/tado-local.db)
 ```
 
@@ -80,11 +110,22 @@ See the interactive API documentation at `/docs` for complete endpoint details.
 
 ### Building
 
-The add-on uses GitHub Actions to automatically build and push Docker images for both amd64 and arm64 architectures.
+`.github/workflows/release.yml` builds and pushes the images on any pushed `v*`
+tag. One job per architecture, one image name per architecture — the Supervisor
+resolves `image: ghcr.io/vvlasy/tado_local_{arch}` to a separate
+`_amd64` / `_aarch64` repository, so a single multi-arch manifest would not work
+here.
 
-Images are pushed to Docker Hub:
-- `rjeevan/tado_local:latest` - Latest build from main branch
-- `rjeevan/tado_local:{version}` - Tagged releases (e.g., v1.0.0)
+The workflow first checks that the `version:` in `tado_local/config.yaml`
+matches the pushed tag (minus a leading `v`) and fails the run if they diverge.
+
+Releasing:
+
+```bash
+# version in tado_local/config.yaml must match the tag without the leading v
+git tag v0.0.1-alpha.10
+git push origin v0.0.1-alpha.10
+```
 
 ### Local Testing
 
@@ -103,31 +144,34 @@ To test the add-on locally:
 hassio-tado-local/
 ├── .github/
 │   └── workflows/
-│       └── build.yml          # CI/CD pipeline
+│       └── release.yml         # Image build + release pipeline
 ├── tado_local/
-│   ├── config.json            # Add-on configuration
-│   ├── Dockerfile             # Docker image definition
-│   ├── run.sh                 # Startup script
-│   └── README.md              # Add-on documentation
-├── repository.json            # Repository metadata
-└── README.md                  # This file
+│   ├── config.yaml             # Add-on manifest
+│   ├── Dockerfile              # Docker image definition
+│   ├── run.sh                  # Startup script
+│   └── README.md               # Add-on documentation
+├── repository.json             # Repository metadata
+└── README.md                   # This file
 ```
 
 ## Requirements
 
-- Home Assistant (Supervised, OS, or Container installation)
+- Home Assistant (Supervised, OS, or Container installation) on `amd64` or `aarch64`
 - TADO bridge device on your local network
 - HomeKit pairing PIN from your TADO bridge
 
 ## Support
 
-- **Issues**: [GitHub Issues](https://github.com/rajeevan/hassio-tado-local/issues)
-- **TadoLocal Project**: [GitHub Repository](https://github.com/rajeevan/TadoLocal)
+- **Issues**: [GitHub Issues](https://github.com/VVlasy/hassio-tado-local/issues)
+
+Issues with this fork's packaging belong here. Issues with the TadoLocal
+application itself belong in the upstream project linked from
+`tado_local/Dockerfile`.
 
 ## License
 
 Apache License 2.0 - see [LICENSE](LICENSE) file for details.
 
-[releases-shield]: https://img.shields.io/github/release/rajeevan/hassio-tado-local.svg
-[releases]: https://github.com/rajeevan/hassio-tado-local/releases
-[license-shield]: https://img.shields.io/github/license/rajeevan/hassio-tado-local.svg
+[releases-shield]: https://img.shields.io/github/release/VVlasy/hassio-tado-local.svg
+[releases]: https://github.com/VVlasy/hassio-tado-local/releases
+[license-shield]: https://img.shields.io/github/license/VVlasy/hassio-tado-local.svg

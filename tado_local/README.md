@@ -4,7 +4,10 @@ Home Assistant add-on for managing TADO devices locally via the HomeKit bridge.
 
 ## Description
 
-This add-on runs the [TadoLocal](https://github.com/rajeevan/TadoLocal) project, which provides a local REST API for controlling TADO devices without relying on cloud services. It communicates directly with your TADO bridge using the HomeKit protocol.
+This add-on runs the TadoLocal project, which provides a local REST API for controlling TADO devices without relying on cloud services. It communicates directly with your TADO bridge using the HomeKit protocol. The application source is downloaded at image build time — see `Dockerfile` for the upstream source it pulls.
+
+Supported architectures: `amd64` and `aarch64`. Images are published to
+`ghcr.io/vvlasy/tado_local_amd64` and `ghcr.io/vvlasy/tado_local_aarch64`.
 
 ## Features
 
@@ -20,7 +23,7 @@ This add-on runs the [TadoLocal](https://github.com/rajeevan/TadoLocal) project,
    - Go to **Settings** > **Add-ons** > **Add-on Store**
    - Click the three dots (⋮) in the top right corner
    - Select **Repositories**
-   - Add: `https://github.com/rajeevan/hassio-tado-local`
+   - Add: `https://github.com/VVlasy/hassio-tado-local`
    - Click **Add**
 
 2. Install the add-on:
@@ -84,8 +87,8 @@ The add-on stores its database in Home Assistant's config directory:
 
 ## Support
 
-- **Issues**: [GitHub Issues](https://github.com/rajeevan/hassio-tado-local/issues)
-- **Source**: [TadoLocal Project](https://github.com/rajeevan/TadoLocal)
+- **Issues**: [GitHub Issues](https://github.com/VVlasy/hassio-tado-local/issues)
+- **Source**: the TadoLocal project tarball referenced in this add-on's `Dockerfile`
 
 ## License
 

@@ -1,5 +1,5 @@
 {
-  "name": "Tado Local Add-ons",
-  "url": "https://github.com/rajeevan/hassio-tado-local",
-  "maintainer": "rajeevan"
+  "name": "Tado Local Add-ons (vvlasy fork)",
+  "url": "https://github.com/VVlasy/hassio-tado-local",
+  "maintainer": "vvlasy"
 }

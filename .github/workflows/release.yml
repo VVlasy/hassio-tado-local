@@ -1,201 +1,88 @@
 name: Release Package Build
 
 on:
-  release:
-    types: [published]
   push:
     tags:
-      - 'v*.*.*'
+      - "v*"
 
 env:
   IMAGE_NAME: tado_local
 
+permissions:
+  contents: write
+  packages: write
+
 jobs:
-  build-and-package:
-    runs-on: ubuntu-latest
-    timeout-minutes: 5 # 5 minutes timeout
-    strategy:
-      matrix:
-        arch:
-          - amd64
-          # - aarch64
+  check-version:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.v.outputs.version }}
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.repository_owner }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Extract version from tag or release
-        id: version
-        run: |
-          if [[ "${{ github.event_name }}" == "release" ]]; then
-            VERSION="${{ github.event.release.tag_name }}"
-          else
-            VERSION="${GITHUB_REF#refs/tags/}"
-          fi
-          # Remove 'v' prefix if present
-          VERSION=${VERSION#v}
-          echo "VERSION=${VERSION}" >> $GITHUB_OUTPUT
-          echo "TAG_NAME=${VERSION}" >> $GITHUB_OUTPUT
-          echo "Version: ${VERSION}"
-
-      - name: Set build args
-        id: build_args
-        run: |
-          ARCH="${{ matrix.arch }}"
-          echo "BUILD_FROM=ghcr.io/home-assistant/${ARCH}-base-python:3.14-alpine3.23" >> $GITHUB_OUTPUT
-
-      - name: Build and push Docker images
-        uses: docker/build-push-action@v5
-        with:
-          context: ./tado_local
-          platforms: linux/${{ matrix.arch }}
-          push: true
-          tags: |
-            ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}_${{ matrix.arch }}:${{ steps.version.outputs.VERSION }}
-            ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}_${{ matrix.arch }}:latest
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-          build-args: |
-            BUILD_FROM=${{ steps.build_args.outputs.BUILD_FROM }}
-
-      - name: Save Docker image as artifact
-        run: |
-          ARCH="${{ matrix.arch }}"
-          # Pull from GHCR (preferred for artifacts)
-          docker pull ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}_${ARCH}:${{ steps.version.outputs.VERSION }}
-          docker save ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}_${ARCH}:${{ steps.version.outputs.VERSION }} | gzip > tado_local_${ARCH}_${{ steps.version.outputs.VERSION }}.tar.gz
-
-      - name: Upload Docker image artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: docker-image-${{ matrix.arch }}-${{ steps.version.outputs.VERSION }}
-          path: tado_local_${{ matrix.arch }}_${{ steps.version.outputs.VERSION }}.tar.gz
-          retention-days: 30
-
-  package-addon:
-    runs-on: ubuntu-latest
-    needs: build-and-package
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Extract version from tag or release
-        id: version
-        run: |
-          if [[ "${{ github.event_name }}" == "release" ]]; then
-            VERSION="${{ github.event.release.tag_name }}"
-          else
-            VERSION="${GITHUB_REF#refs/tags/}"
-          fi
-          # Remove 'v' prefix if present
-          VERSION=${VERSION#v}
-          echo "VERSION=${VERSION}" >> $GITHUB_OUTPUT
-          echo "TAG_NAME=v${VERSION}" >> $GITHUB_OUTPUT
-          echo "Version: ${VERSION}"
-
-      - name: Update config.yaml with version
-        run: |
-          VERSION="${{ steps.version.outputs.VERSION }}"
-          # Update version in config.yaml
-          sed -i "s/version: \".*\"/version: \"${VERSION}\"/" tado_local/config.yaml
-          # Update image reference to use GHCR
-          sed -i "s|image: \".*\"|image: \"ghcr.io/${{ github.repository_owner }}/tado_local_{arch}:${VERSION}\"|" tado_local/config.yaml
-
-      - name: Create add-on package
-        run: |
-          VERSION="${{ steps.version.outputs.VERSION }}"
-          mkdir -p release
-          cp -r tado_local release/
-          cp repository.json release/
-          cd release
-          tar czf ../tado_local_addon_${VERSION}.tar.gz *
-          cd ..
-
-      - name: Upload add-on package artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: addon-package-${{ steps.version.outputs.VERSION }}
-          path: tado_local_addon_${{ steps.version.outputs.VERSION }}.tar.gz
-          retention-days: 90
-
-  create-release:
-    runs-on: ubuntu-latest
-    needs: [build-and-package, package-addon]
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Extract version from tag
-        id: version
+      - uses: actions/checkout@v4
+      - id: v
         run: |
           VERSION="${GITHUB_REF#refs/tags/}"
-          # Remove 'v' prefix if present
-          VERSION=${VERSION#v}
-          echo "VERSION=${VERSION}" >> $GITHUB_OUTPUT
-          echo "TAG_NAME=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          VERSION="${VERSION#v}"
+          CFG=$(grep -oP '^version:\s*"\K[^"]+' tado_local/config.yaml)
+          echo "tag=$VERSION  config.yaml=$CFG"
+          if [ "$VERSION" != "$CFG" ]; then
+            echo "::error::config.yaml version ($CFG) != git tag ($VERSION)"
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: artifacts
-
-      - name: Create Release
-        uses: softprops/action-gh-release@v1
-        with:
-          tag_name: ${{ steps.version.outputs.TAG_NAME }}
-          name: Release ${{ steps.version.outputs.TAG_NAME }}
-          body: |
-            ## Release ${{ steps.version.outputs.TAG_NAME }}
-            
-            ### Docker Images (GHCR)
-            - `ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}_amd64:${{ steps.version.outputs.VERSION }}`
-            - `ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}_aarch64:${{ steps.version.outputs.VERSION }}`
-            
-            ### Installation
-            1. Download the add-on package from the assets below
-            2. Or add this repository to Home Assistant: `https://github.com/${{ github.repository_owner }}/hassio-tado-local`
-          files: |
-            artifacts/addon-package-${{ steps.version.outputs.VERSION }}/tado_local_addon_${{ steps.version.outputs.VERSION }}.tar.gz
-          draft: false
-          prerelease: ${{ contains(steps.version.outputs.VERSION, 'alpha') || contains(steps.version.outputs.VERSION, 'beta') || contains(steps.version.outputs.VERSION, 'rc') }}
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-  attach-artifacts-to-release:
-    runs-on: ubuntu-latest
-    needs: [build-and-package, package-addon]
-    if: github.event_name == 'release'
+  build:
+    needs: check-version
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     steps:
-      - name: Extract version from release
-        id: version
+      - uses: actions/checkout@v4
+      - name: Lowercase owner
+        id: owner
+        run: echo "name=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: ./tado_local
+          platforms: ${{ matrix.platform }}
+          provenance: false
+          push: true
+          tags: |
+            ghcr.io/${{ steps.owner.outputs.name }}/${{ env.IMAGE_NAME }}_${{ matrix.arch }}:${{ needs.check-version.outputs.version }}
+            ghcr.io/${{ steps.owner.outputs.name }}/${{ env.IMAGE_NAME }}_${{ matrix.arch }}:latest
+          cache-from: type=gha,scope=${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
+          build-args: |
+            BUILD_FROM=ghcr.io/home-assistant/${{ matrix.arch }}-base-python:3.14-alpine3.23
+      - name: Verify the pushed manifest is pullable
         run: |
-          VERSION="${{ github.event.release.tag_name }}"
-          # Remove 'v' prefix if present
-          VERSION=${VERSION#v}
-          echo "VERSION=${VERSION}" >> $GITHUB_OUTPUT
+          docker pull ghcr.io/${{ steps.owner.outputs.name }}/${{ env.IMAGE_NAME }}_${{ matrix.arch }}:${{ needs.check-version.outputs.version }}
 
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
+  release:
+    needs: [check-version, build]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: softprops/action-gh-release@v2
         with:
-          path: artifacts
-
-      - name: Attach artifacts to release
-        uses: softprops/action-gh-release@v1
-        with:
-          files: |
-            artifacts/addon-package-${{ steps.version.outputs.VERSION }}/tado_local_addon_${{ steps.version.outputs.VERSION }}.tar.gz
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          prerelease: ${{ contains(needs.check-version.outputs.version, 'alpha') || contains(needs.check-version.outputs.version, 'beta') || contains(needs.check-version.outputs.version, 'rc') }}
+          body: |
+            Images:
+            - `ghcr.io/${{ github.repository_owner }}/tado_local_amd64:${{ needs.check-version.outputs.version }}`
+            - `ghcr.io/${{ github.repository_owner }}/tado_local_aarch64:${{ needs.check-version.outputs.version }}`

@@ -1,5 +1,5 @@
 name: "Tado Local"
-version: "0.0.1-alpha.10"
+version: "0.0.1-alpha.11"
 slug: "tado_local"
 description: "Manage TADO devices locally via HomeKit bridge"
 url: "https://github.com/VVlasy/hassio-tado-local"
@@ -28,8 +28,10 @@ options:
   state_db: "/config/tado_local/tado-local.db"
   bridge_ip: "192.168.1.100"
   pin: "000-11-222"
+  event_stale_timeout: 3600
 schema:
   state_db: str
   bridge_ip: str
   pin: str
+  event_stale_timeout: "int(0,)?"
 image: ghcr.io/vvlasy/tado_local_{arch}

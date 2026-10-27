@@ -49,6 +49,7 @@ Supported architectures: `amd64` and `aarch64`. Images are published to
 |--------|----------|-------------|
 | `bridge_ip` | Yes | IP address of your TADO bridge on the local network |
 | `pin` | Yes | HomeKit pairing PIN (format: XXX-XX-XXX) |
+| `event_stale_timeout` | No | Seconds without HomeKit events before the add-on resubscribes, then reconnects (default `3600`, `0` disables). See `patches/`. |
 
 ### Finding Your Bridge IP and PIN
 

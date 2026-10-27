@@ -9,7 +9,8 @@ RUN \
     apk add --no-cache \
         tzdata \
         wget \
-        tar
+        tar \
+        patch
 
 # Download tado_local source tarball from GitHub (auto-mode-schedule branch)
 RUN \
@@ -17,6 +18,15 @@ RUN \
         https://github.com/rajeevan/TadoLocal/archive/refs/heads/auto-mode-schedule.tar.gz && \
     tar -xzf /tmp/tado_local.tar.gz -C /tmp && \
     rm /tmp/tado_local.tar.gz
+
+# Apply local fixes on top of upstream. The build fails if a patch no longer
+# applies, so an upstream change can't silently drop a fix.
+COPY patches /tmp/patches
+RUN \
+    for p in /tmp/patches/*.patch; do \
+        patch -d /tmp/TadoLocal-auto-mode-schedule -p1 --forward < "$p"; \
+    done && \
+    rm -rf /tmp/patches
 
 # Install dependencies first (if requirements.txt exists, install it separately for better caching)
 RUN \

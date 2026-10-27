@@ -1,0 +1,392 @@
+From e07b910a3e77ebf668a148145c52145e7ca1b237 Mon Sep 17 00:00:00 2001
+From: Victor <20575526+VVlasy@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 15:24:26 +0000
+Subject: [PATCH] Recover HomeKit event stream when it goes quiet
+
+Temperatures only arrive as HomeKit push events. If the subscription dies
+silently (or aiohomekit sets supports_subscribe=False after a disconnect
+during resubscribe), temperatures freeze while /status still reports
+connected.
+
+Add a watchdog: after --event-stale-timeout seconds (default 3600, 0
+disables) without events, resubscribe; if still quiet a window later, drop
+the transport so aiohomekit reconnects, re-verifies and resubscribes. Each
+step also polls once to catch up. /status gains events_stale and a
+homekit_events block (last_event_at, seconds_since_last_event, recovery
+counters).
+---
+ tado_local/__main__.py       |   4 +-
+ tado_local/api.py            | 136 +++++++++++++++++++++++++++++++-
+ tado_local/routes.py         |   2 +
+ tests/test_event_watchdog.py | 149 +++++++++++++++++++++++++++++++++++
+ 4 files changed, 289 insertions(+), 2 deletions(-)
+ create mode 100644 tests/test_event_watchdog.py
+
+diff --git a/tado_local/__main__.py b/tado_local/__main__.py
+index 57d6ac3..0085521 100644
+--- a/tado_local/__main__.py
++++ b/tado_local/__main__.py
+@@ -93,7 +93,7 @@ async def run_server(args):
+             raise
+ 
+         # Initialize the API with database path
+-        tado_api = TadoLocalAPI(str(db_path))
++        tado_api = TadoLocalAPI(str(db_path), event_stale_timeout=args.event_stale_timeout)
+ 
+         # Initialize Tado Cloud API (always enabled)
+         cloud_api = TadoCloudAPI(str(db_path), tado_api=tado_api)
+@@ -407,6 +407,8 @@ API Endpoints:
+                        help="HomeKit PIN for initial pairing (XXX-XX-XXX format)")
+     parser.add_argument("--port", type=int, default=4407,
+                        help="Port for REST API server (default: 4407)")
++    parser.add_argument("--event-stale-timeout", type=float, default=3600,
++                       help="Seconds without HomeKit events before resubscribing, then reconnecting (default: 3600, 0 disables)")
+     parser.add_argument("--clear-pairings", action="store_true",
+                        help="Clear all existing pairings from database before starting")
+     parser.add_argument("--verbose", action="store_true",
+diff --git a/tado_local/api.py b/tado_local/api.py
+index e0a3615..6c0efc7 100644
+--- a/tado_local/api.py
++++ b/tado_local/api.py
+@@ -43,7 +43,7 @@ class TadoLocalAPI:
+     characteristic_iid_map : Dict[tuple[int, str], int]
+     device_to_characteristics : Dict[int, List[tuple[int, int, str]]]  # device_id -> [(aid, iid, char_type)]
+ 
+-    def __init__(self, db_path: str):
++    def __init__(self, db_path: str, event_stale_timeout: float = 3600):
+         self.pairing: Optional[IpPairing] = None
+         self.accessories_cache = []
+         self.accessories_dict = {}
+@@ -67,6 +67,17 @@ class TadoLocalAPI:
+         # Scheduler service
+         self.scheduler_service: Optional[Any] = None
+ 
++        # HomeKit event stream health. Temperatures only arrive as push events,
++        # so a silently dead subscription freezes them while /status still
++        # looks fine. The watchdog resubscribes, then reconnects.
++        self.event_stale_timeout = event_stale_timeout  # seconds, 0 disables
++        self.events_active = False
++        self.last_event_time: Optional[float] = None
++        self.last_recovery_time: Optional[float] = None
++        self.last_recovery_action: Optional[str] = None
++        self.recovery_attempts = 0  # attempts in the current stale episode
++        self.recovery_count = 0  # attempts since start
++
+     async def initialize(self, pairing: IpPairing):
+         """Initialize the API with a HomeKit pairing."""
+         self.pairing = pairing
+@@ -361,6 +372,12 @@ class TadoLocalAPI:
+             await self.setup_polling_system()
+         else:
+             logger.info("Events active, skipping polling (would just hit 3-hour cache)")
++            self.events_active = True
++            self.last_event_time = time.time()
++            if self.event_stale_timeout > 0:
++                task = asyncio.create_task(self.event_watchdog_loop())
++                self.background_tasks.append(task)
++                logger.info(f"Event watchdog started (stale after {self.event_stale_timeout:.0f}s without events)")
+ 
+     async def setup_persistent_events(self):
+         """Set up persistent event subscriptions to all event characteristics."""
+@@ -371,6 +388,10 @@ class TadoLocalAPI:
+             def event_callback(update_data : dict[tuple[int, int], dict]):
+                 """Handle ALL HomeKit characteristic updates."""
+                 logger.debug(f"Event callback received update: {update_data}")
++                # aiohomekit sends an empty update when a connection is (re)made
++                if update_data:
++                    self.last_event_time = time.time()
++                    self.recovery_attempts = 0
+                 for k, v in update_data.items():
+                     asyncio.create_task(self.handle_change(k[0], k[1], v, source="EVENT"))
+ 
+@@ -755,6 +776,119 @@ class TadoLocalAPI:
+         except Exception as e:
+             logger.debug(f"Error broadcasting state change: {e}")
+ 
++    def get_event_health(self) -> dict:
++        """Health of the HomeKit event stream, for /status."""
++        now = time.time()
++        since = now - self.last_event_time if self.last_event_time else None
++        return {
++            "events_active": self.events_active,
++            "connected": bool(self.pairing and self.pairing.is_connected),
++            "supports_subscribe": bool(self.pairing and self.pairing.supports_subscribe),
++            "last_event_at": self.last_event_time,
++            "seconds_since_last_event": int(since) if since is not None else None,
++            "stale_timeout": self.event_stale_timeout,
++            "stale": self.is_event_stream_stale(now),
++            "recovery_attempts": self.recovery_attempts,
++            "recovery_count": self.recovery_count,
++            "last_recovery_at": self.last_recovery_time,
++            "last_recovery_action": self.last_recovery_action,
++        }
++
++    def is_event_stream_stale(self, now: Optional[float] = None) -> bool:
++        """True when events are expected but none arrived within the stale timeout."""
++        if not self.events_active or self.event_stale_timeout <= 0 or not self.last_event_time:
++            return False
++        return (now or time.time()) - self.last_event_time > self.event_stale_timeout
++
++    async def event_watchdog_loop(self):
++        """Recover the HomeKit event stream when it goes quiet.
++
++        HomeKit only sends events on change, so silence alone is not proof of
++        failure, but resubscribing is idempotent and cheap. Each stale episode
++        escalates: first resubscribe, then drop the connection so aiohomekit
++        reconnects, re-verifies the pairing and resubscribes (what a restart did).
++        """
++        check_interval = min(60, self.event_stale_timeout)
++        while not self.is_shutting_down:
++            try:
++                await asyncio.sleep(check_interval)
++                await self.check_event_stream()
++            except asyncio.CancelledError:
++                raise
++            except Exception as e:
++                logger.error(f"Event watchdog error: {e}")
++
++    async def check_event_stream(self):
++        """Run one watchdog check and, if needed, one recovery step."""
++        if not self.pairing or not self.subscribed_characteristics:
++            return
++
++        now = time.time()
++
++        # aiohomekit permanently disables push (supports_subscribe = False) if a
++        # (re)subscribe hits a disconnect. Events then never come back on their
++        # own, so treat this as stale right away.
++        if not self.pairing.supports_subscribe:
++            logger.warning("aiohomekit disabled push subscriptions for this session; re-enabling")
++            self.pairing.supports_subscribe = True
++        elif not self.is_event_stream_stale(now):
++            return
++        elif self.last_recovery_time and now - self.last_recovery_time < self.event_stale_timeout:
++            return  # give the previous recovery step a full window to work
++
++        quiet = int(now - self.last_event_time) if self.last_event_time else None
++        self.recovery_attempts += 1
++        self.recovery_count += 1
++        self.last_recovery_time = now
++
++        if self.recovery_attempts == 1:
++            self.last_recovery_action = "resubscribe"
++            logger.warning(f"No HomeKit events for {quiet}s, resubscribing to {len(self.subscribed_characteristics)} characteristics")
++            ok = await self._resubscribe()
++            if not ok:
++                self.last_recovery_action = "reconnect"
++                logger.warning("Resubscribe failed, forcing reconnect")
++                await self._force_reconnect()
++        else:
++            self.last_recovery_action = "reconnect"
++            logger.warning(f"Still no HomeKit events for {quiet}s (attempt {self.recovery_attempts}), forcing reconnect")
++            await self._force_reconnect()
++
++        # Pick up whatever changed while events were missing. Reads may come
++        # from the bridge cache, so this is a catch-up, not a replacement for events.
++        await self._poll_characteristics(self.subscribed_characteristics, "WATCHDOG-POLL")
++
++    async def _resubscribe(self) -> bool:
++        """Send ev=true for all tracked characteristics again."""
++        try:
++            status = await self.pairing.subscribe(self.subscribed_characteristics)
++        except Exception as e:
++            logger.warning(f"Resubscribe error: {e}")
++            return False
++        if not self.pairing.supports_subscribe:
++            return False
++        rejected = {k: v for k, v in (status or {}).items() if v.get("status") != 0}
++        if rejected:
++            logger.warning(f"Resubscribe rejected for {len(rejected)} characteristics: {list(rejected.items())[:5]}")
++            return False
++        return True
++
++    async def _force_reconnect(self):
++        """Drop the transport so aiohomekit reconnects and resubscribes.
++
++        pairing.close() is not used: it marks the connection closed for good.
++        Closing the transport takes aiohomekit's normal connection-lost path,
++        which reconnects, runs pair-verify and resubscribes everything.
++        """
++        connection = self.pairing.connection
++        if connection.transport:
++            connection.transport.close()
++        try:
++            await asyncio.wait_for(connection.ensure_connection(), timeout=30)
++            logger.info("Reconnected to HomeKit bridge")
++        except Exception as e:
++            logger.warning(f"Reconnect not finished yet ({e}); aiohomekit keeps retrying")
++
+     async def setup_polling_system(self):
+         """Setup polling system for comparison with events."""
+         try:
+diff --git a/tado_local/routes.py b/tado_local/routes.py
+index fa8d4dd..a79acb5 100644
+--- a/tado_local/routes.py
++++ b/tado_local/routes.py
+@@ -202,6 +202,8 @@ def register_routes(app: FastAPI, get_tado_api):
+                 "active_listeners": len(tado_api.event_listeners),
+                 "events_received": tado_api.change_tracker.get('events_received', 0),
+                 "polling_changes": tado_api.change_tracker.get('polling_changes', 0),
++                "events_stale": tado_api.is_event_stream_stale(),
++                "homekit_events": tado_api.get_event_health(),
+                 "uptime": time.time() - (tado_api.last_update or time.time())
+             }
+ 
+diff --git a/tests/test_event_watchdog.py b/tests/test_event_watchdog.py
+new file mode 100644
+index 0000000..37eaa4d
+--- /dev/null
++++ b/tests/test_event_watchdog.py
+@@ -0,0 +1,149 @@
++import asyncio
++import time
++
++import pytest
++
++from tado_local.api import TadoLocalAPI
++
++
++class FakeTransport:
++    def __init__(self, connection):
++        self.connection = connection
++
++    def close(self):
++        self.connection.transport = None
++        self.connection.closed_count += 1
++
++
++class FakeConnection:
++    def __init__(self):
++        self.transport = FakeTransport(self)
++        self.closed_count = 0
++
++    async def ensure_connection(self):
++        self.transport = FakeTransport(self)
++
++
++class FakePairing:
++    def __init__(self, subscribe_status=None, subscribe_error=None):
++        self.connection = FakeConnection()
++        self.supports_subscribe = True
++        self.subscribe_calls = 0
++        self.subscribe_status = subscribe_status or {}
++        self.subscribe_error = subscribe_error
++        self.polled = []
++
++    @property
++    def is_connected(self):
++        return self.connection.transport is not None
++
++    async def subscribe(self, chars):
++        self.subscribe_calls += 1
++        if self.subscribe_error:
++            raise self.subscribe_error
++        return self.subscribe_status
++
++    async def get_characteristics(self, chars):
++        self.polled.extend(chars)
++        return {}
++
++
++def make_api(tmp_path, pairing, timeout=600):
++    api = TadoLocalAPI(str(tmp_path / "t.db"), event_stale_timeout=timeout)
++    api.pairing = pairing
++    api.subscribed_characteristics = [(1, 10), (2, 10)]
++    api.change_tracker = {'last_values': {}, 'events_received': 0, 'polling_changes': 0}
++    api.events_active = True
++    api.last_event_time = time.time()
++    return api
++
++
++@pytest.mark.asyncio
++async def test_fresh_stream_does_nothing(tmp_path):
++    pairing = FakePairing()
++    api = make_api(tmp_path, pairing)
++    await api.check_event_stream()
++    assert pairing.subscribe_calls == 0
++    assert api.is_event_stream_stale() is False
++    assert api.get_event_health()["stale"] is False
++
++
++@pytest.mark.asyncio
++async def test_stale_resubscribes_then_reconnects(tmp_path):
++    pairing = FakePairing()
++    api = make_api(tmp_path, pairing)
++    api.last_event_time = time.time() - 700
++    assert api.is_event_stream_stale()
++
++    await api.check_event_stream()
++    assert pairing.subscribe_calls == 1
++    assert pairing.connection.closed_count == 0
++    assert api.last_recovery_action == "resubscribe"
++    assert pairing.polled == api.subscribed_characteristics
++
++    # Within the same window nothing more happens
++    await api.check_event_stream()
++    assert pairing.subscribe_calls == 1
++
++    # Next window still silent -> reconnect
++    api.last_recovery_time -= 700
++    await api.check_event_stream()
++    assert pairing.connection.closed_count == 1
++    assert pairing.is_connected
++    assert api.last_recovery_action == "reconnect"
++    assert api.recovery_attempts == 2
++
++
++@pytest.mark.asyncio
++async def test_rejected_resubscribe_reconnects_immediately(tmp_path):
++    pairing = FakePairing(subscribe_status={(1, 10): {"status": -70402, "description": "x"},
++                                            (2, 10): {"status": 0, "description": "ok"}})
++    api = make_api(tmp_path, pairing)
++    api.last_event_time = time.time() - 700
++    await api.check_event_stream()
++    assert pairing.connection.closed_count == 1
++    assert api.last_recovery_action == "reconnect"
++
++
++@pytest.mark.asyncio
++async def test_all_ok_status_rows_count_as_success(tmp_path):
++    pairing = FakePairing(subscribe_status={(1, 10): {"status": 0, "description": "ok"}})
++    api = make_api(tmp_path, pairing)
++    api.last_event_time = time.time() - 700
++    await api.check_event_stream()
++    assert pairing.connection.closed_count == 0
++
++
++@pytest.mark.asyncio
++async def test_disabled_push_is_reenabled_without_waiting(tmp_path):
++    pairing = FakePairing()
++    pairing.supports_subscribe = False
++    api = make_api(tmp_path, pairing)
++    await api.check_event_stream()
++    assert pairing.supports_subscribe is True
++    assert pairing.subscribe_calls == 1
++
++
++@pytest.mark.asyncio
++async def test_event_resets_episode(tmp_path):
++    pairing = FakePairing()
++    api = make_api(tmp_path, pairing)
++    api.recovery_attempts = 3
++    api.pairing.dispatcher_connect = lambda cb: setattr(api, "_cb", cb)
++    api.accessories_cache = []
++    api.change_tracker['event_characteristics'] = set()
++    # setup_persistent_events registers the callback even with no characteristics
++    await api.setup_persistent_events()
++    api.last_event_time = 0
++    api._cb({})  # empty update on reconnect is not an event
++    assert api.last_event_time == 0
++    api._cb({(1, 10): {"value": 21.5}})
++    await asyncio.sleep(0)
++    assert api.last_event_time > 0
++    assert api.recovery_attempts == 0
++
++
++def test_timeout_zero_disables(tmp_path):
++    api = make_api(tmp_path, FakePairing(), timeout=0)
++    api.last_event_time = 1
++    assert api.is_event_stream_stale() is False
+-- 
+2.43.0
+
